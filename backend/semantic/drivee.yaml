@@ -1,0 +1,309 @@
+version: 1
+domain: drivee
+description: |
+  Semantic layer for Drivee ride-hailing platform.
+  Exposed to LLM instead of raw tables.
+  Supports Russian synonyms for every entity / measure / metric.
+
+entities:
+  city:
+    table: dim_cities
+    key: city_id
+    label_column: city_name
+    synonyms:
+      ru: ["город", "город заказа", "город поездки", "по городам", "в городе"]
+      en: ["city", "pickup city"]
+
+  channel:
+    table: dim_channels
+    key: channel_id
+    label_column: channel_name
+    synonyms:
+      ru: ["канал", "источник заказа", "откуда заказ"]
+      en: ["channel", "acquisition channel"]
+
+  user:
+    table: dim_users
+    key: user_id
+    synonyms:
+      ru: ["пользователь", "клиент", "пассажир", "водитель"]
+      en: ["user", "rider", "driver"]
+    pii: true
+    pii_columns: [phone_masked, email_hash]
+    roles:
+      allow: [analyst]
+      deny: [business_user]
+
+facts:
+  trips:
+    table: fct_trips
+    grain: "one row per booked trip (completed, cancelled, or no-show)"
+    time_column: trip_start_ts
+    require_time_filter: true
+    foreign_keys:
+      city_id: city
+      rider_id: user
+      driver_id: user
+      channel_id: channel
+
+    dimensions:
+      - name: city_name
+        join: "JOIN dim_cities c ON c.city_id = fct_trips.city_id"
+        expr: c.city_name
+        synonyms_ru: ["город", "по городам", "в городе"]
+      - name: channel_name
+        join: "JOIN dim_channels ch ON ch.channel_id = fct_trips.channel_id"
+        expr: ch.channel_name
+        synonyms_ru: ["канал", "источник", "приложение", "веб", "партнёры"]
+      - name: status
+        expr: fct_trips.status
+        synonyms_ru: ["статус", "состояние поездки"]
+      - name: cancellation_party
+        expr: fct_trips.cancellation_party
+        synonyms_ru: ["кто отменил", "по чьей вине", "сторона отмены"]
+      - name: cancellation_reason
+        expr: fct_trips.cancellation_reason
+        synonyms_ru: ["причина отмены"]
+      - name: segment
+        join: "JOIN dim_users u_r ON u_r.user_id = fct_trips.rider_id"
+        expr: u_r.segment
+        synonyms_ru: ["сегмент", "новый клиент", "лояльный", "VIP"]
+      - name: hour_of_day
+        expr: "extract(hour from fct_trips.trip_start_ts)"
+        synonyms_ru: ["час поездки", "время суток"]
+      - name: weekday
+        expr: "to_char(fct_trips.trip_start_ts, 'Day')"
+        synonyms_ru: ["день недели"]
+
+    measures:
+      - name: trips_total
+        expr: "count(*)"
+        synonyms_ru: ["количество поездок", "поездки", "число поездок"]
+      - name: trips_completed
+        expr: "count(*) FILTER (WHERE fct_trips.status = 'completed')"
+        synonyms_ru: ["завершённые поездки", "успешные поездки"]
+      - name: cancellations_total
+        expr: "count(*) FILTER (WHERE fct_trips.status = 'cancelled')"
+        synonyms_ru: ["отмены", "количество отмен", "отменённые поездки"]
+      - name: driver_cancellations
+        expr: "count(*) FILTER (WHERE fct_trips.status = 'cancelled' AND fct_trips.cancellation_party = 'driver')"
+        synonyms_ru: ["отмены водителем", "отмены по вине водителя"]
+      - name: rider_cancellations
+        expr: "count(*) FILTER (WHERE fct_trips.status = 'cancelled' AND fct_trips.cancellation_party = 'rider')"
+        synonyms_ru: ["отмены пассажиром", "отмены по вине пассажира"]
+      - name: system_cancellations
+        expr: "count(*) FILTER (WHERE fct_trips.status = 'cancelled' AND fct_trips.cancellation_party = 'system')"
+        synonyms_ru: ["отмены по вине системы"]
+      # Бизнес-инвариант (Эдуард, брифинг 2026-04): выручка / средний чек /
+      # длительность / расстояние / рейтинг считаются ТОЛЬКО по completed
+      # поездкам — иначе делитель включает no_show и cancelled с NULL fare,
+      # и среднее уезжает вниз. FILTER (...) даёт правильную формулу прямо
+      # в семантическом слое, чтобы LLM не забыла этот фильтр.
+      - name: revenue
+        expr: "sum(fct_trips.actual_fare) FILTER (WHERE fct_trips.status = 'completed')"
+        synonyms_ru: ["выручка", "доход", "сумма поездок"]
+      - name: average_fare
+        expr: "avg(fct_trips.actual_fare) FILTER (WHERE fct_trips.status = 'completed')"
+        synonyms_ru: ["средний чек", "средняя цена поездки", "средняя стоимость"]
+      - name: average_distance
+        expr: "avg(fct_trips.distance_km) FILTER (WHERE fct_trips.status = 'completed')"
+        synonyms_ru: ["средняя дистанция", "средняя длина поездки"]
+      - name: average_duration
+        expr: "avg(fct_trips.duration_minutes) FILTER (WHERE fct_trips.status = 'completed')"
+        synonyms_ru: ["средняя длительность", "средний ETA", "среднее время поездки", "ETA", "ETA по городам", "среднее время в пути"]
+      - name: average_surge
+        expr: "avg(fct_trips.surge_multiplier)"
+        synonyms_ru: ["средний surge", "средний коэффициент повышения"]
+      - name: average_rating
+        expr: "avg(fct_trips.rating) FILTER (WHERE fct_trips.rating IS NOT NULL)"
+        synonyms_ru: ["средний рейтинг"]
+      - name: mau
+        expr: "count(DISTINCT fct_trips.rider_id)"
+        synonyms_ru: ["активные пользователи", "уникальные пассажиры", "MAU"]
+
+metrics:
+  cancellation_rate:
+    expr: "count(*) FILTER (WHERE fct_trips.status = 'cancelled')::float / nullif(count(*), 0)"
+    label_ru: "доля отмен"
+    synonyms_ru: ["процент отмен", "коэффициент отмен", "доля отменённых"]
+
+  driver_cancellation_rate:
+    expr: "count(*) FILTER (WHERE fct_trips.cancellation_party = 'driver')::float / nullif(count(*), 0)"
+    label_ru: "доля отмен по вине водителя"
+    synonyms_ru: ["процент отмен по вине водителя"]
+
+  rider_cancellation_rate:
+    expr: "count(*) FILTER (WHERE fct_trips.cancellation_party = 'rider')::float / nullif(count(*), 0)"
+    label_ru: "доля отмен по вине пассажира"
+
+  completion_rate:
+    expr: "count(*) FILTER (WHERE fct_trips.status = 'completed')::float / nullif(count(*), 0)"
+    label_ru: "конверсия (доля завершённых)"
+    synonyms_ru: ["конверсия", "доля завершённых", "процент завершения"]
+
+policies:
+  deny_tables: ["users_raw", "payments_raw"]
+  require_time_filter_tables: ["fct_trips"]
+  default_limit: 500
+  max_joins: 5
+  max_total_cost: 1.0e7
+  max_plan_rows: 10000000
+  # PII-блок-листы по ролям. Колонки в этом списке заблокированы guardrails
+  # на уровне AST (до EXPLAIN). business_user видит только маски/хеши;
+  # analyst имеет доступ к маскам, но raw phone/email/PAN/CVV/паспорт
+  # заблокированы для всех ролей (защита от компрометации в случае, если
+  # такие колонки появятся в схеме).
+  pii_columns_by_role:
+    business_user:
+      - phone_masked
+      - email_hash
+      - phone
+      - phone_number
+      - email
+      - full_name
+      - first_name
+      - last_name
+      - passport
+      - pan
+      - cvv
+    analyst:
+      - phone
+      - phone_number
+      - email
+      - full_name
+      - passport
+      - pan
+      - cvv
+
+time_expressions:
+  ru:
+    # ----- закрытые исторические окна (правый край < now) -----
+    "вчера": "fct_trips.trip_start_ts >= date_trunc('day', now()) - interval '1 day' AND fct_trips.trip_start_ts < date_trunc('day', now())"
+    "на прошлой неделе": "fct_trips.trip_start_ts >= date_trunc('week', now()) - interval '1 week' AND fct_trips.trip_start_ts < date_trunc('week', now())"
+    "за прошлый месяц": "fct_trips.trip_start_ts >= date_trunc('month', now()) - interval '1 month' AND fct_trips.trip_start_ts < date_trunc('month', now())"
+    "за прошлый квартал": "fct_trips.trip_start_ts >= date_trunc('quarter', now()) - interval '3 months' AND fct_trips.trip_start_ts < date_trunc('quarter', now())"
+    "за прошлый год": "fct_trips.trip_start_ts >= date_trunc('year', now()) - interval '1 year' AND fct_trips.trip_start_ts < date_trunc('year', now())"
+
+    # ----- ОТКРЫТЫЕ текущие окна (правый край = now()) -----
+    # ВАЖНО: для «этой недели/месяца» правая граница ОБЯЗАТЕЛЬНО = now(),
+    # а не date_trunc(...) — иначе получится пустой интервал >= X AND < X
+    # (см. guardrails._check_empty_range и регрессионный тест в
+    # tests/test_guardrails.py::test_reject_empty_range_this_week).
+    "сегодня": "fct_trips.trip_start_ts >= date_trunc('day', now()) AND fct_trips.trip_start_ts < now()"
+    "на этой неделе": "fct_trips.trip_start_ts >= date_trunc('week', now()) AND fct_trips.trip_start_ts < now()"
+    "за эту неделю": "fct_trips.trip_start_ts >= date_trunc('week', now()) AND fct_trips.trip_start_ts < now()"
+    "в этом месяце": "fct_trips.trip_start_ts >= date_trunc('month', now()) AND fct_trips.trip_start_ts < now()"
+    "за этот месяц": "fct_trips.trip_start_ts >= date_trunc('month', now()) AND fct_trips.trip_start_ts < now()"
+    "в этом квартале": "fct_trips.trip_start_ts >= date_trunc('quarter', now()) AND fct_trips.trip_start_ts < now()"
+    "в этом году": "fct_trips.trip_start_ts >= date_trunc('year', now()) AND fct_trips.trip_start_ts < now()"
+
+    # ----- скользящие окна -----
+    "за последние 7 дней": "fct_trips.trip_start_ts >= now() - interval '7 days'"
+    "за последние 30 дней": "fct_trips.trip_start_ts >= now() - interval '30 days'"
+    "за последний квартал": "fct_trips.trip_start_ts >= now() - interval '3 months'"
+    "за последний год": "fct_trips.trip_start_ts >= now() - interval '12 months'"
+
+    # ----- календарные месяцы текущего года -----
+    "в марте": "extract(month from fct_trips.trip_start_ts) = 3 AND extract(year from fct_trips.trip_start_ts) = extract(year from now())"
+    "в январе": "extract(month from fct_trips.trip_start_ts) = 1 AND extract(year from fct_trips.trip_start_ts) = extract(year from now())"
+
+cities_canonical:
+  ru:
+    # Одно и то же слово в разных падежах: «в москве» / «по москве» /
+    # «московских» — exact-lookup стартует с lowercase токена N-граммы,
+    # без морфологии. Поэтому проще дописать формы тут, чем заводить
+    # pymorphy. Список покрывает 95% реальных формулировок из голден-сета.
+    "москва": "Москва"
+    "москве": "Москва"
+    "москву": "Москва"
+    "москвы": "Москва"
+    "москвой": "Москва"
+    "мск": "Москва"
+    "санкт-петербург": "Санкт-Петербург"
+    "санкт петербург": "Санкт-Петербург"
+    "санкт-петербурге": "Санкт-Петербург"
+    "санкт-петербурга": "Санкт-Петербург"
+    "спб": "Санкт-Петербург"
+    "питер": "Санкт-Петербург"
+    "питере": "Санкт-Петербург"
+    "питера": "Санкт-Петербург"
+    "питеру": "Санкт-Петербург"
+    "новосибирск": "Новосибирск"
+    "новосибирске": "Новосибирск"
+    "новосибирска": "Новосибирск"
+    "нск": "Новосибирск"
+    "екатеринбург": "Екатеринбург"
+    "екатеринбурге": "Екатеринбург"
+    "екб": "Екатеринбург"
+    "казань": "Казань"
+    "казани": "Казань"
+    "краснодар": "Краснодар"
+    "краснодаре": "Краснодар"
+    "кдр": "Краснодар"
+    "нижний новгород": "Нижний Новгород"
+    "нижнем новгороде": "Нижний Новгород"
+    "самара": "Самара"
+    "самаре": "Самара"
+    "ростов-на-дону": "Ростов-на-Дону"
+    "ростове-на-дону": "Ростов-на-Дону"
+    "уфа": "Уфа"
+    "уфе": "Уфа"
+
+# ----------------------------------------------------------------------------
+# Value linking — DB content retrieval
+# ----------------------------------------------------------------------------
+# Pre-indexed enum-like columns whose distinct values are loaded into a
+# Chroma collection at startup. The pipeline's `linking` stage matches NL
+# tokens against these values (exact > unaccent > embedding) and adds a
+# VALUE_LINKS block to the user prompt so the LLM uses the canonical
+# database value instead of whatever phrasing the user typed
+# («айос» → 'app', «питер» → 'Санкт-Петербург').
+#
+# Inspired by BRIDGE (anchor matching), CHESS (LSH nearest-neighbour)
+# and CodeS (BM25 + LCS).
+value_linking:
+  enabled_columns:
+    - alias: city
+      table: dim_cities
+      column: city_name
+      # Synonyms reuse the cities_canonical map already maintained for
+      # guardrails — single source of truth for spelling variants.
+      synonyms_from: cities_canonical_ru
+
+    - alias: channel
+      table: dim_channels
+      column: channel_name
+      synonyms:
+        "app": ["приложение", "айос", "андроид", "ios", "android", "мобильное", "мобильный", "мобильное приложение", "телефон"]
+        "web": ["веб", "сайт", "браузер", "вебсайт", "интернет", "десктоп"]
+        "partner": ["партнёр", "партнер", "партнёры", "партнеры", "партнерский", "корпоративный", "b2b"]
+
+    - alias: trip_status
+      table: fct_trips
+      column: status
+      synonyms:
+        "completed": ["завершён", "завершено", "завершенные", "завершённые", "успешные", "успешно", "выполненные", "состоявшиеся", "доехали"]
+        "cancelled": ["отменён", "отменено", "отменённые", "отмененные", "сорвавшиеся"]
+        "no_show": ["неявка", "не явился", "не приехал", "no-show", "no show"]
+
+    - alias: cancel_party
+      table: fct_trips
+      column: cancellation_party
+      synonyms:
+        "driver": ["водитель", "водителем", "по вине водителя", "со стороны водителя"]
+        "rider": ["пассажир", "пассажиром", "клиент", "по вине пассажира", "со стороны пассажира"]
+        "system": ["система", "системой", "автоматически", "технически"]
+
+    - alias: cancel_reason
+      table: fct_trips
+      column: cancellation_reason
+      # Reasons are already in Russian; embedding match handles paraphrases
+      # like «авария» → «технический сбой» on its own.
+
+    - alias: segment
+      table: dim_users
+      column: segment
+      synonyms:
+        "new": ["новый", "новый клиент", "новички", "новые", "первая поездка"]
+        "loyal": ["лояльный", "лояльные", "постоянный", "постоянные", "loyalty"]
+        "vip": ["VIP", "вип", "премиум", "premium", "топ-клиент"]

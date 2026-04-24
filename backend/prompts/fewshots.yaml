@@ -1,0 +1,199 @@
+examples:
+  - nl_ru: "Сколько поездок было завершено на прошлой неделе по каждому городу?"
+    tags: [metric_by_dim, previous_week]
+    sql: |
+      SELECT c.city_name,
+             COUNT(*) FILTER (WHERE t.status = 'completed') AS trips_completed
+      FROM fct_trips t
+      JOIN dim_cities c ON c.city_id = t.city_id
+      WHERE t.trip_start_ts >= date_trunc('week', now()) - interval '1 week'
+        AND t.trip_start_ts <  date_trunc('week', now())
+      GROUP BY c.city_name
+      ORDER BY trips_completed DESC
+      LIMIT 500;
+
+  - nl_ru: "Какой процент отмен по вине водителя за последние 7 дней в Москве и Санкт-Петербурге?"
+    tags: [rate_by_dim, last_7_days, city_filter]
+    sql: |
+      SELECT c.city_name,
+             COUNT(*) FILTER (WHERE t.cancellation_party = 'driver')::float
+               / NULLIF(COUNT(*), 0) AS driver_cancel_rate
+      FROM fct_trips t
+      JOIN dim_cities c ON c.city_id = t.city_id
+      WHERE t.trip_start_ts >= now() - interval '7 days'
+        AND c.city_name IN ('Москва', 'Санкт-Петербург')
+      GROUP BY c.city_name
+      LIMIT 500;
+
+  - nl_ru: "Сравни количество поездок по каналам за последние 30 дней."
+    tags: [metric_by_dim, last_30_days, channel]
+    sql: |
+      SELECT ch.channel_name, COUNT(*) AS trips_total
+      FROM fct_trips t
+      JOIN dim_channels ch ON ch.channel_id = t.channel_id
+      WHERE t.trip_start_ts >= now() - interval '30 days'
+      GROUP BY ch.channel_name
+      ORDER BY trips_total DESC
+      LIMIT 500;
+
+  - nl_ru: "Как изменилась доля отмен по вине пассажира неделя-к-неделе?"
+    tags: [week_over_week, window]
+    sql: |
+      WITH by_week AS (
+        SELECT date_trunc('week', trip_start_ts) AS wk,
+               COUNT(*) FILTER (WHERE cancellation_party = 'rider')::float
+                 / NULLIF(COUNT(*), 0) AS rider_cancel_rate
+        FROM fct_trips
+        WHERE trip_start_ts >= now() - interval '8 weeks'
+        GROUP BY 1
+      )
+      SELECT wk, rider_cancel_rate,
+             LAG(rider_cancel_rate) OVER (ORDER BY wk) AS prev_rate,
+             rider_cancel_rate - LAG(rider_cancel_rate) OVER (ORDER BY wk) AS delta
+      FROM by_week
+      ORDER BY wk;
+
+  - nl_ru: "Средний чек поездки по сегментам пользователей за прошлый месяц."
+    tags: [avg_by_dim, previous_month, segment]
+    sql: |
+      SELECT u.segment, AVG(t.actual_fare) AS avg_fare
+      FROM fct_trips t
+      JOIN dim_users u ON u.user_id = t.rider_id
+      WHERE t.trip_start_ts >= date_trunc('month', now()) - interval '1 month'
+        AND t.trip_start_ts <  date_trunc('month', now())
+        AND t.status = 'completed'
+      GROUP BY u.segment
+      ORDER BY avg_fare DESC;
+
+  - nl_ru: "В каких городах доля поездок с расстоянием меньше 3 км превышает 40%?"
+    tags: [filter_on_measure]
+    sql: |
+      SELECT c.city_name,
+             SUM(CASE WHEN t.distance_km < 3 THEN 1 ELSE 0 END)::float
+               / NULLIF(COUNT(*), 0) AS short_ratio
+      FROM fct_trips t
+      JOIN dim_cities c ON c.city_id = t.city_id
+      WHERE t.trip_start_ts >= now() - interval '30 days'
+      GROUP BY c.city_name
+      HAVING SUM(CASE WHEN t.distance_km < 3 THEN 1 ELSE 0 END)::float
+             / NULLIF(COUNT(*), 0) > 0.4
+      ORDER BY short_ratio DESC;
+
+  - nl_ru: "Воронка: сколько заказов создано, подтверждено, завершено за прошлую неделю."
+    tags: [funnel, previous_week]
+    sql: |
+      SELECT
+        COUNT(*)                                            AS created,
+        COUNT(*) FILTER (WHERE trip_start_ts IS NOT NULL)   AS confirmed,
+        COUNT(*) FILTER (WHERE status = 'completed')        AS completed
+      FROM fct_trips
+      WHERE booking_ts >= date_trunc('week', now()) - interval '1 week'
+        AND booking_ts <  date_trunc('week', now());
+
+  - nl_ru: "Какой средний ETA по городам за последние 3 месяца?"
+    tags: [eta_alias, average_duration, city]
+    sql: |
+      SELECT c.city_name, AVG(t.duration_minutes) AS avg_duration
+      FROM fct_trips t JOIN dim_cities c ON c.city_id = t.city_id
+      WHERE t.trip_start_ts >= now() - interval '90 days'
+        AND t.status = 'completed'
+      GROUP BY c.city_name ORDER BY avg_duration DESC;
+
+  - nl_ru: "Какой процент поездок завершается с опозданием больше 5 минут относительно обещанного ETA?"
+    tags: [late_ratio, eta_alias]
+    sql: |
+      SELECT SUM(CASE WHEN duration_minutes > 25 THEN 1 ELSE 0 END)::float
+               / NULLIF(COUNT(*), 0) AS late_ratio
+      FROM fct_trips
+      WHERE trip_start_ts >= now() - interval '30 days'
+        AND status = 'completed';
+
+  - nl_ru: "Сколько водителей были онлайн более 40 часов за прошлую неделю?"
+    tags: [driver_activity, sum_duration]
+    sql: |
+      SELECT COUNT(*) AS active_drivers
+      FROM (SELECT driver_id, SUM(duration_minutes)/60.0 AS hrs
+            FROM fct_trips
+            WHERE trip_start_ts >= date_trunc('week', now()) - interval '1 week'
+              AND trip_start_ts <  date_trunc('week', now())
+              AND status = 'completed'
+            GROUP BY driver_id HAVING SUM(duration_minutes)/60.0 > 40) q;
+
+  - nl_ru: "В каком городе самая высокая доля поездок, заказанных через партнёрские каналы?"
+    tags: [rate_ranking, partner_ratio]
+    sql: |
+      SELECT c.city_name,
+             SUM(CASE WHEN ch.channel_name = 'partner' THEN 1 ELSE 0 END)::float
+               / NULLIF(COUNT(*), 0) AS partner_ratio
+      FROM fct_trips t
+      JOIN dim_cities c ON c.city_id = t.city_id
+      JOIN dim_channels ch ON ch.channel_id = t.channel_id
+      WHERE t.trip_start_ts >= now() - interval '30 days'
+      GROUP BY c.city_name
+      ORDER BY partner_ratio DESC;
+
+  - nl_ru: "Какой процент пользователей возвращается через 30 дней после первой поездки?"
+    tags: [retention, cohort, window]
+    sql: |
+      WITH first_trip AS (
+        SELECT rider_id, MIN(trip_start_ts) AS first_ts
+        FROM fct_trips
+        WHERE trip_start_ts >= now() - interval '365 days'
+        GROUP BY rider_id),
+      retained AS (
+        SELECT f.rider_id
+        FROM first_trip f JOIN fct_trips t ON t.rider_id = f.rider_id
+        WHERE t.trip_start_ts BETWEEN f.first_ts + interval '30 days'
+                                  AND f.first_ts + interval '60 days'
+        GROUP BY f.rider_id)
+      SELECT COUNT(DISTINCT r.rider_id)::float / NULLIF(COUNT(DISTINCT f.rider_id),0) AS d30_retention
+      FROM first_trip f LEFT JOIN retained r ON r.rider_id = f.rider_id;
+
+  - nl_ru: "Сколько пользователей отменили более двух поездок подряд за последние 30 дней?"
+    tags: [churn, cohort_count]
+    sql: |
+      SELECT COUNT(*) AS risky_users
+      FROM (SELECT rider_id
+            FROM fct_trips
+            WHERE trip_start_ts >= now() - interval '30 days'
+              AND status = 'cancelled'
+              AND cancellation_party = 'rider'
+            GROUP BY rider_id
+            HAVING COUNT(*) > 2) q;
+
+  - nl_ru: "Как распределяются отмены по причинам за последний месяц?"
+    tags: [breakdown, nullable_dim]
+    sql: |
+      SELECT cancellation_reason, COUNT(*) AS cnt
+      FROM fct_trips
+      WHERE status = 'cancelled'
+        AND cancellation_reason IS NOT NULL
+        AND trip_start_ts >= now() - interval '30 days'
+      GROUP BY cancellation_reason
+      ORDER BY cnt DESC;
+
+  - nl_ru: "Распределение длительности поездок по корзинам 0-10, 10-20, 20-30 минут за прошлый месяц."
+    tags: [histogram, bucket]
+    sql: |
+      SELECT CASE
+               WHEN duration_minutes < 10 THEN '0-10'
+               WHEN duration_minutes < 20 THEN '10-20'
+               WHEN duration_minutes < 30 THEN '20-30'
+               ELSE '30+'
+             END AS bucket,
+             COUNT(*) AS cnt
+      FROM fct_trips
+      WHERE trip_start_ts >= date_trunc('month', now()) - interval '1 month'
+        AND trip_start_ts <  date_trunc('month', now())
+        AND status = 'completed'
+      GROUP BY bucket ORDER BY bucket;
+
+  - nl_ru: "Сколько поездок было оплачено через приложение и сколько через веб за прошлую неделю?"
+    tags: [metric_by_dim, channel_filter, no_order_by]
+    sql: |
+      SELECT ch.channel_name, COUNT(*) AS trips_total
+      FROM fct_trips t JOIN dim_channels ch ON ch.channel_id = t.channel_id
+      WHERE t.trip_start_ts >= date_trunc('week', now()) - interval '1 week'
+        AND t.trip_start_ts <  date_trunc('week', now())
+        AND ch.channel_name IN ('app', 'web')
+      GROUP BY ch.channel_name;
