@@ -1,12 +1,8 @@
 # Drivee DataPilot
 
-[![CI](../../actions/workflows/ci.yml/badge.svg)](../../actions/workflows/ci.yml)
-
 Self-service аналитика на естественном языке для ride-hailing данных.
 Пишешь вопрос по-русски — получаешь SQL, таблицу и график. Всё работает
 локально, никаких обращений к внешним API.
-
-![Архитектура](docs/architecture.svg)
 
 ## Стек
 
