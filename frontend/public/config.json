@@ -1,0 +1,3 @@
+{
+  "_comment": "Override any defaults from src/config/defaults.ts here. Empty object = keep built-in defaults. UI overrides (localStorage) win over this file. Arrays REPLACE the corresponding default array — don't include `roles: []` here unless you want to wipe all roles."
+}
